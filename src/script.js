@@ -1,4 +1,6 @@
-
+let mixer;
+let modelCache = {};
+const modelLoader = new THREE.GLTFLoader(); 
 // Enhanced configuration
 const CONFIG = {
     SIMULATION_INTERVAL: 2500,
@@ -138,7 +140,7 @@ function setupThreeJS() {
     renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
     renderer.setSize(window.innerWidth, window.innerHeight);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.shadowMap.enabled = true;
+    // renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.setClearColor(0x87CEEB);
     
@@ -402,6 +404,70 @@ function createInitialPopulation() {
 function createPerson(x, z, type = 'citizen') {
     if (people.length >= CONFIG.MAX_PEOPLE) return null;
     
+    const personGroup = new THREE.Group();
+    
+    // First create a simple placeholder (cube) while loading
+    const placeholderGeometry = new THREE.BoxGeometry(0.6, 1.8, 0.6);
+    const placeholderMaterial = new THREE.MeshBasicMaterial({ 
+        color: 0xff0000,
+        transparent: true,
+        opacity: 0.5,
+        wireframe: true
+    });
+    const placeholder = new THREE.Mesh(placeholderGeometry, placeholderMaterial);
+    personGroup.add(placeholder);
+    
+    personGroup.position.set(x, 0.9, z);
+    personGroup.userData = {
+        type: 'person',
+        personType: type,
+        walkSpeed: Math.random() * 0.025 + 0.01,
+        walkDirection: new THREE.Vector3(
+            Math.random() - 0.5, 0, Math.random() - 0.5
+        ).normalize(),
+        idleTime: 0,
+        isIdle: false,
+        animations: null,
+        mixer: null,
+        modelLoaded: false
+    };
+    
+    // Load the 3D model based on type
+    loadPersonModel(personGroup, type).then((loadedPerson) => {
+        if (loadedPerson) {
+            // Remove placeholder
+            personGroup.remove(placeholder);
+            
+            // Add the loaded model
+            scene.add(personGroup);
+            people.push(personGroup);
+            interactiveObjects.push(personGroup);
+            
+            // Add entry animation
+            personGroup.scale.set(0.1, 0.1, 0.1);
+            gsap.to(personGroup.scale, {
+                x: 1, y: 1, z: 1,
+                duration: 0.6,
+                ease: "back.out(1.7)"
+            });
+        }
+    }).catch(error => {
+        console.warn('Failed to load model, using placeholder:', error);
+        // Use the placeholder as fallback
+        placeholder.material.color.setHex(getColorForType(type));
+        placeholder.material.wireframe = false;
+        placeholder.material.opacity = 1;
+        
+        scene.add(personGroup);
+        people.push(personGroup);
+        interactiveObjects.push(personGroup);
+    });
+    
+    return personGroup;
+}
+
+// Helper function to get colors for different types
+function getColorForType(type) {
     const colors = {
         citizen: 0x3498db,
         openBorders: 0xe74c3c,
@@ -411,41 +477,250 @@ function createPerson(x, z, type = 'citizen') {
         family: 0xe91e63,
         investor: 0x2ecc71
     };
-    
-    const personGroup = new THREE.Group();
-    
-    const bodyGeometry = new THREE.CylinderGeometry(0.3, 0.3, 1.5, 8);
-    const bodyMaterial = new THREE.MeshLambertMaterial({ 
-        color: colors[type] || 0x3498db 
-    });
-    const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
-    body.position.y = 0.75;
-    body.castShadow = true;
-    personGroup.add(body);
-    
-    const headGeometry = new THREE.SphereGeometry(0.25, 10, 10);
-    const head = new THREE.Mesh(headGeometry, bodyMaterial);
-    head.position.y = 1.7;
-    head.castShadow = true;
-    personGroup.add(head);
-    
-    personGroup.position.set(x, 0, z);
-    personGroup.userData = {
-        type: 'person',
-        personType: type,
-        walkSpeed: Math.random() * 0.025 + 0.01,
-        walkDirection: new THREE.Vector3(
-            Math.random() - 0.5, 0, Math.random() - 0.5
-        ).normalize(),
-        idleTime: 0,
-        isIdle: false
+    return colors[type] || 0x3498db;
+}
+
+// Function to load 3D model
+// Function to load 3D model - MINIMAL FIX VERSION
+async function loadPersonModel(personGroup, personType) {
+    // Map person types to model files
+    const modelMap = {
+        citizen: './assets/models/male/scene.gltf',
+        openBorders: './assets/models/male/scene.gltf',
+        skilledWorker: './assets/models/male/scene.gltf',
+        refugee: './assets/models/male/scene.gltf',
+        family: './assets/models/male/scene.gltf',
+        investor: './assets/models/male/scene.gltf',
+        skilled: './assets/models/male/scene.gltf'
     };
     
-    scene.add(personGroup);
-    people.push(personGroup);
-    interactiveObjects.push(personGroup);
+    const modelPath = './assets/models/male/scene.gltf';
     
-    return personGroup;
+    return new Promise((resolve, reject) => {
+        // Check cache first
+        if (modelCache[modelPath]) {
+            const model = modelCache[modelPath].clone();
+            setupModel(personGroup, model);
+            setupSimpleAnimations(personGroup, model); // SIMPLE version
+            resolve(personGroup);
+            return;
+        }
+        
+        // Load the model
+        modelLoader.load(
+            modelPath,
+            (gltf) => {
+                // Cache the loaded model
+                modelCache[modelPath] = gltf.scene;
+                
+                // Clone the model for this person
+                const model = gltf.scene.clone();
+                
+                setupModel(personGroup, model);
+                
+                // Set up SIMPLE animations
+                setupSimpleAnimations(personGroup, model, gltf.animations);
+                
+                resolve(personGroup);
+            },
+            // Progress callback
+            (xhr) => {
+                const percentComplete = (xhr.loaded / xhr.total) * 100;
+                if (percentComplete % 25 < 1) {
+                    console.log(`${personType} model: ${percentComplete.toFixed(0)}% loaded`);
+                }
+            },
+            // Error callback
+            (error) => {
+                console.error('Error loading model:', error);
+                reject(error);
+            }
+        );
+    });
+}
+
+// SIMPLE animation setup that won't break your models
+function setupSimpleAnimations(personGroup, model, animations) {
+    if (!animations || animations.length === 0) {
+        console.log('No animations found');
+        return;
+    }
+    
+    console.log('Available animations:', animations.map(a => a.name).join(', '));
+    
+    // Create animation mixer
+    const mixer = new THREE.AnimationMixer(model);
+    personGroup.userData.mixer = mixer;
+    
+    // Try to find and play any walk animation
+    let walkAnimation = null;
+    
+    // Look for walk animations
+    for (const anim of animations) {
+        if (anim.name.toLowerCase().includes('walk')) {
+            walkAnimation = anim;
+            break;
+        }
+    }
+    
+    // If no walk animation found, use first animation
+    if (!walkAnimation) {
+        walkAnimation = animations[0];
+    }
+    
+    console.log('Using animation:', walkAnimation.name);
+    
+    // Create and play the animation
+    const action = mixer.clipAction(walkAnimation);
+    action.play();
+    
+    // Store reference
+    personGroup.userData.walkAction = action;
+}
+// Function to set up animations
+function setupAnimations(personGroup, model, animations) {
+    if (!animations || animations.length === 0) {
+        console.log('No animations found for this model');
+        return;
+    }
+    
+    console.log('Setting up animations...');
+    
+    // Create animation mixer
+    personGroup.userData.mixer = new THREE.AnimationMixer(model);
+    
+    // Find walking animation
+    let walkAnimation = null;
+    
+    // Try to find walk animation by name
+    const walkKeywords = ['walk', 'Walk', 'WALK', 'slow', 'Slow', 'Slow Walk', 'slow_walk'];
+    
+    for (const anim of animations) {
+        for (const keyword of walkKeywords) {
+            if (anim.name.includes(keyword)) {
+                walkAnimation = anim;
+                console.log(`Found walk animation: "${anim.name}"`);
+                break;
+            }
+        }
+        if (walkAnimation) break;
+    }
+    
+    // If no walk animation found, use the first animation
+    if (!walkAnimation) {
+        walkAnimation = animations[0];
+        console.log(`Using first animation: "${walkAnimation.name}"`);
+    }
+    
+    // Create and play the animation
+    const action = personGroup.userData.mixer.clipAction(walkAnimation);
+    action.play();
+    
+    console.log('Animation playing:', walkAnimation.name);
+    
+    // Store animation info for debugging
+    personGroup.userData.animationName = walkAnimation.name;
+    personGroup.userData.animationDuration = walkAnimation.duration;
+}
+// Add this debug function
+// function debugFilePaths() {
+//     console.log('Testing file paths...');
+//     console.log('Current working directory:', window.location.href);
+    
+//     // Test if the file exists
+//     const testPaths = [
+//         './assets/models/male/scene.gltf',
+//         'assets/models/male/scene.gltf',
+//         '/assets/models/male/scene.gltf',
+//         'models/male/scene.gltf'
+//     ];
+    
+//     testPaths.forEach(path => {
+//         fetch(path)
+//             .then(response => {
+//                 console.log(`✓ Path accessible: ${path}`);
+//             })
+//             .catch(error => {
+//                 console.log(`✗ Path not accessible: ${path}`);
+//             });
+//     });
+// }
+
+// Call this in your init or after DOM loads
+window.addEventListener('DOMContentLoaded', () => {
+    debugFilePaths(); // Add this line
+    initVRScene();
+    // ... rest of your code
+});
+// Function to set up the model
+// Function to set up the model with proper rotation and scaling
+function setupModel(personGroup, model) {
+    // Calculate the bounding box
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+    
+    console.log('Model size:', size);
+    console.log('Model center:', center);
+    
+    // Calculate scale to make person ~1.8 units tall (human height)
+    const targetHeight = 1.8;
+    let scale;
+
+
+    scale = targetHeight / size.z;
+    
+    // Rotate model to stand up
+    model.rotation.x = Math.PI / 2;
+    
+    // Determine which axis is height (usually Y, but sometimes Z)
+    // if (size.y >= size.z && size.y >= size.x) {
+    //     // Model is standing up (Y is height)
+    //     scale = targetHeight / size.y;
+    // } else if (size.z >= size.y && size.z >= size.x) {
+    //     // Model is lying down (Z is height) - need to rotate
+    //     scale = targetHeight / size.z;
+        
+    //     // Rotate model to stand up
+    //     model.rotation.x = Math.PI / 2; // Rotate 90 degrees
+    //     console.log('Rotated model to stand up');
+    // } else {
+    //     // Model is on its side (X is height) - need to rotate
+    //     scale = targetHeight / size.x;
+        
+    //     // Rotate model to stand up
+    //     model.rotation.z = Math.PI / 2; // Rotate 90 degrees
+    //     console.log('Rotated model to stand up');
+    // }
+    
+    // Apply scale
+    model.scale.setScalar(scale * 0.8); // Slightly smaller for better fit
+    
+    // Center the model
+    model.position.sub(center.multiplyScalar(scale));
+    
+    // Position model at ground level
+    model.position.y =  -0.5  *scale; // Slightly above ground
+    
+    // Add to person group
+    personGroup.add(model);
+    
+    // Enable shadows
+    model.traverse((child) => {
+        if (child.isMesh) {
+            child.castShadow = true;
+            child.receiveShadow = true;
+            
+            // Optional: Improve material appearance
+            if (child.material) {
+                child.material.roughness = 0.8;
+                child.material.metalness = 0.2;
+            }
+        }
+    });
+    
+    personGroup.userData.modelLoaded = true;
+    console.log('Model setup complete with scale:', scale);
 }
 
 function setupMiniMap() {
@@ -1113,7 +1388,6 @@ function interactWithObject() {
         }
     }
 }
-
 function updateObjects(delta) {
     const elapsedTime = clock.getElapsedTime();
     
@@ -1121,41 +1395,132 @@ function updateObjects(delta) {
         monument.rotation.y = elapsedTime * 0.12;
     }
     
+    // Update animation mixers for all people FIRST
+    people.forEach((person) => {
+        if (person.userData.mixer) {
+            person.userData.mixer.update(delta);
+        }
+    });
+    
+    // Now update positions and behavior
     people.forEach((person, index) => {
         const data = person.userData;
         
         if (data.isIdle) {
+            // IDLE STATE - standing still
             data.idleTime += delta;
-            if (data.idleTime > 2.5) {
+            
+            // Subtle idle breathing animation
+            person.position.y = 0.9 + Math.sin(elapsedTime * 1.5 + index) * 0.005;
+            
+            // End idle period and start walking
+            if (data.idleTime > 2 + Math.random() * 3) {
                 data.isIdle = false;
                 data.idleTime = 0;
                 data.walkDirection.set(
-                    Math.random() - 0.5, 0, Math.random() - 0.5
+                    Math.random() - 0.5, 
+                    0, 
+                    Math.random() - 0.5
                 ).normalize();
+                
+                // Start walk animation if available
+                if (data.walkAction && data.walkAction.paused) {
+                    data.walkAction.play();
+                    data.walkAction.timeScale = 1.0; // Normal walking speed
+                }
+                
+                // Pause idle animation if available
+                if (data.idleAction && !data.idleAction.paused) {
+                    data.idleAction.pause();
+                }
             }
+            
         } else {
-            person.position.x += data.walkDirection.x * data.walkSpeed;
-            person.position.z += data.walkDirection.z * data.walkSpeed;
+            // WALKING STATE - moving around
             
-            const distance = Math.sqrt(person.position.x ** 2 + person.position.z ** 2);
-            if (distance > CONFIG.BORDER_RADIUS - 3) {
-                data.walkDirection.multiplyScalar(-1);
-                data.isIdle = true;
+            // Calculate movement (this is what makes them actually move forward)
+            const walkDistance = 0.03; // Adjust this value to control walking speed
+            person.position.x += data.walkDirection.x * walkDistance;
+            person.position.z += data.walkDirection.z * walkDistance;
+            
+            // Make person face walking direction
+            if (Math.abs(data.walkDirection.x) > 0.01 || Math.abs(data.walkDirection.z) > 0.01) {
+                const targetAngle = Math.atan2(data.walkDirection.x, data.walkDirection.z);
+                person.rotation.y = targetAngle;
             }
             
-            if (Math.random() < 0.008) {
+            // Walking bobbing motion
+            person.position.y = 0.9 + Math.sin(elapsedTime * 8 + index) * 0.02;
+            
+            // Check if person hits the border
+            const distanceFromCenter = Math.sqrt(
+                person.position.x * person.position.x + 
+                person.position.z * person.position.z
+            );
+            
+            if (distanceFromCenter > CONFIG.BORDER_RADIUS - 4) {
+                // Hit border - bounce back
+                data.walkDirection.multiplyScalar(-0.7); // Reverse and slow down
+                data.walkDirection.normalize();
+                
+                // Add some random angle variation
+                const randomAngle = (Math.random() - 0.5) * Math.PI / 3;
+                const currentAngle = Math.atan2(data.walkDirection.x, data.walkDirection.z);
+                const newAngle = currentAngle + randomAngle;
+                
+                data.walkDirection.set(
+                    Math.sin(newAngle),
+                    0,
+                    Math.cos(newAngle)
+                ).normalize();
+                
+                // Briefly go idle
                 data.isIdle = true;
+                data.idleTime = Math.random() * 1.5;
             }
             
-            person.position.y = Math.sin(elapsedTime * 2.5 + index) * 0.04;
+            // Random chance to switch to idle
+            if (Math.random() < 0.002) {
+                data.isIdle = true;
+                data.idleTime = Math.random() * 2 + 1;
+            }
+        }
+        
+        // Keep within bounds (safety check)
+        const maxDistance = CONFIG.BORDER_RADIUS - 3;
+        const currentDistance = Math.sqrt(person.position.x ** 2 + person.position.z ** 2);
+        if (currentDistance > maxDistance) {
+            const scale = maxDistance / currentDistance;
+            person.position.x *= scale;
+            person.position.z *= scale;
         }
     });
     
+    // Update building animations
     buildings.forEach((building, index) => {
         building.rotation.y = Math.sin(elapsedTime * 0.1 + index) * 0.002;
     });
 }
-
+// Fix skinned mesh warnings
+// function fixSkinnedMeshWarnings(model) {
+//     model.traverse((child) => {
+//         if (child.isSkinnedMesh && child.material) {
+//             // Enable skinning for the material (CRITICAL for animations)
+//             child.material.skinning = true;
+            
+//             // Disable shadows to avoid warnings
+//             child.castShadow = false;
+//             child.receiveShadow = false;
+            
+//             // If material is an array (multiple materials)
+//             if (Array.isArray(child.material)) {
+//                 child.material.forEach(mat => {
+//                     mat.skinning = true;
+//                 });
+//             }
+//         }
+//     });
+// }
 function animate() {
     requestAnimationFrame(animate);
     
