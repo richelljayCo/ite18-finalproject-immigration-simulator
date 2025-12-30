@@ -1,6 +1,10 @@
-let mixer;
+// ==============================================
+// SECTION 1: CONFIGURATION & GAME STATE
+// ==============================================
+
+// Removed GLTF-related variables
 let modelCache = {};
-const modelLoader = new THREE.GLTFLoader(); 
+
 // Enhanced configuration
 const CONFIG = {
     SIMULATION_INTERVAL: 2500,
@@ -8,14 +12,15 @@ const CONFIG = {
     INITIAL_GDP: 55000,
     INITIAL_HAPPINESS: 70,
     INITIAL_UNEMPLOYMENT: 5.0,
-    INITIAL_BUDGET: 55000,
+    INITIAL_BUDGET: 10000,
     MOVEMENT_SPEED: 6,
     MOUSE_SENSITIVITY: 0.002,
     JUMP_FORCE: 9,
     GRAVITY: 9.8,
     FOG_DENSITY: 0.025,
     MAX_PEOPLE: 150,
-    BORDER_RADIUS: 50
+    BORDER_RADIUS: 50,
+    CITY_RADIUS: 45 // Keep people away from border
 };
 
 // Enhanced game state
@@ -32,6 +37,8 @@ const gameState = {
     score: 0,
     weather: 'sunny',
     achievements: new Set(),
+    refugeeProgramStarted: null,
+    
     policies: {
         openBorders: false,
         skilledWorker: false,
@@ -40,14 +47,16 @@ const gameState = {
         investor: false,
         strict: false
     },
+    
     policyCosts: {
-        openBorders: 500,
-        skilledWorker: 300,
-        refugee: 400,
-        family: 200,
-        investor: 100,
+        openBorders: 700,
+        skilledWorker: 600,
+        refugee: 900,
+        family: 400,
+        investor: -1500, // Negative = income
         strict: 300
     },
+    
     difficultySettings: {
         easy: { budget: 10000, happinessDrain: 1, unempMultiplier: 0.7, gdpMultiplier: 1.3 },
         medium: { budget: 5000, happinessDrain: 2, unempMultiplier: 1.0, gdpMultiplier: 1.0 },
@@ -80,84 +89,402 @@ let miniMapCtx;
 // Loading
 let loadingProgress = 0;
 
-function updateLoadingProgress(step, message) {
-    loadingProgress = (step / 8) * 100;
-    document.getElementById('loadingProgress').style.width = `${loadingProgress}%`;
-    document.getElementById('loadingSubtitle').textContent = message;
-    document.getElementById('loadingObjects').textContent = Math.floor(50 + step * 20);
-    document.getElementById('loadingTextures').textContent = Math.floor(10 + step * 4);
-    document.getElementById('loadingModels').textContent = Math.floor(5 + step * 3);
+// ==============================================
+// SECTION 2: CORE GAME LOGIC
+// ==============================================
+
+// Budget and Economy System
+function calculateYearlyBudget() {
+    let totalIncome = 0;
+    let totalExpenses = 0;
+    
+    // INCOME
+    totalIncome += Math.floor(gameState.gdp * 0.25); // 25% tax rate
+    totalIncome += Math.floor(gameState.population * 0.5); // Tourism/export
+    
+    // POLICY INCOME (Investor visa gives money)
+    if (gameState.policies.investor) {
+        totalIncome += 1500;
+    }
+    
+    // EXPENSES
+    // Base infrastructure costs
+    totalExpenses += Math.floor(gameState.population * 0.8); // Healthcare, education, etc.
+    
+    // Policy maintenance costs
+    Object.keys(gameState.policies).forEach(policy => {
+        if (gameState.policies[policy]) {
+            const cost = gameState.policyCosts[policy];
+            if (cost > 0) totalExpenses += cost;
+        }
+    });
+    
+    // Unemployment benefits
+    const unemployed = Math.floor(gameState.population * (gameState.unemployment / 100));
+    totalExpenses += unemployed * 100;
+    
+    return totalIncome - totalExpenses;
 }
 
-function initVRScene() {
-    updateLoadingProgress(1, 'Initializing graphics engine...');
-    setupThreeJS();
+function simulateYear() {
+    if (!gameState.started || gameState.paused) return;
     
-    updateLoadingProgress(2, 'Creating environment...');
-    createScene();
+    gameState.year++;
     
-    updateLoadingProgress(3, 'Building terrain...');
-    createGround();
+    // Track changes for this year
+    let gdpChange = 0;
+    let happinessChange = 0;
+    let unemploymentChange = 0;
+    let populationChange = 0;
     
-    updateLoadingProgress(4, 'Constructing border...');
-    createBorder();
-    createGates();
+    const difficulty = gameState.difficultySettings[gameState.difficulty];
     
-    updateLoadingProgress(5, 'Generating city...');
-    createBuildings();
+    // BASE CHANGES (happens every year)
+    happinessChange -= difficulty.happinessDrain;
+    gdpChange += Math.floor(gameState.population / 100);
+    gdpChange += Math.floor(Math.random() * 800 - 400);
     
-    updateLoadingProgress(6, 'Adding landmarks...');
-    createMonument();
-    createInteractiveObjects();
+    // --- POLICY EFFECTS ---
     
-    updateLoadingProgress(7, 'Populating world...');
-    createInitialPopulation();
+    // 1. OPEN BORDERS
+    if (gameState.policies.openBorders) {
+        const immigrants = 60;
+        populationChange += immigrants;
+        gdpChange += 1200;
+        happinessChange -= 12;
+        unemploymentChange += 2.5;
+        spawnImmigrants(6, 'openBorders');
+    }
     
-    updateLoadingProgress(8, 'Finalizing...');
-    setupControls();
-    setupMiniMap();
-    animate();
+    // 2. SKILLED WORKER
+    if (gameState.policies.skilledWorker) {
+        const immigrants = 20;
+        populationChange += immigrants;
+        gdpChange += 2200;
+        unemploymentChange -= 1.2;
+        happinessChange -= 5;
+        
+        if (Math.random() < 0.15) {
+            populationChange -= 3;
+            showNotification("🧠 Skilled workers leaving for better opportunities abroad", "error");
+        }
+        
+        spawnImmigrants(4, 'skilledWorker');
+    }
     
-    setTimeout(() => {
-        document.getElementById('loadingScreen').classList.add('fade-out');
-        setTimeout(() => {
-            document.getElementById('loadingScreen').style.display = 'none';
-            document.getElementById('vrMenu').classList.add('active');
-        }, 1000);
-    }, 500);
+    // 3. REFUGEE PROGRAM
+    if (gameState.policies.refugee) {
+        const immigrants = 30;
+        populationChange += immigrants;
+        happinessChange += 8;
+        gdpChange -= 400;
+        unemploymentChange += 1.5;
+        
+        if (gameState.refugeeProgramStarted && gameState.year >= gameState.refugeeProgramStarted + 2) {
+            gdpChange += 600;
+            unemploymentChange -= 1.0;
+            showNotification("🛡️ Refugees integrated successfully!", "success");
+        }
+        
+        spawnImmigrants(5, 'refugee');
+    }
+    
+    // 4. FAMILY REUNIFICATION
+    if (gameState.policies.family) {
+        const immigrants = 25;
+        populationChange += immigrants;
+        happinessChange += 15;
+        gdpChange -= 300;
+        
+        if (Math.random() < 0.3) {
+            populationChange += 5;
+            showNotification("👶 Family policies lead to baby boom!", "success");
+        }
+        
+        spawnImmigrants(5, 'family');
+    }
+    
+    // 5. INVESTOR VISA
+    if (gameState.policies.investor) {
+        const immigrants = 8;
+        populationChange += immigrants;
+        gdpChange += 1800;
+        happinessChange -= 8;
+        unemploymentChange -= 0.8;
+        
+        if (Math.random() < 0.1) {
+            gameState.budget -= 1000;
+            happinessChange -= 10;
+            showNotification("⚖️ Investor visa corruption scandal!", "error");
+        }
+        
+        spawnImmigrants(2, 'investor');
+    }
+    
+    // 6. STRICT CONTROLS
+    if (gameState.policies.strict) {
+        populationChange = Math.floor(populationChange * 0.5);
+        gdpChange = Math.floor(gdpChange * 0.7);
+        happinessChange += 20;
+        
+        const naturalDecline = Math.floor(gameState.population * 0.008);
+        populationChange -= naturalDecline;
+        gdpChange -= Math.floor(gameState.gdp * 0.01);
+        
+        if (naturalDecline > 0) {
+            showNotification("📉 Aging population: Workforce shrinking", "error");
+        }
+    }
+    
+    // --- APPLY ALL CHANGES ---
+    
+    gameState.population = Math.max(100, gameState.population + populationChange);
+    gameState.gdp = Math.max(1000, gameState.gdp + gdpChange);
+    gameState.happiness = Math.max(0, Math.min(100, gameState.happiness + happinessChange));
+    gameState.unemployment = Math.max(0, Math.min(40, gameState.unemployment + unemploymentChange));
+    
+    // Budget calculation
+    const budgetChange = calculateYearlyBudget();
+    gameState.budget += budgetChange;
+    
+    // Score
+    const newScore = Math.floor(
+        (populationChange * 2) + 
+        (gdpChange / 100) + 
+        (happinessChange * 3) - 
+        (Math.abs(unemploymentChange) * 20)
+    );
+    gameState.score += Math.max(-1000, newScore);
+    
+    // Random events
+    if (Math.random() < 0.25) {
+        triggerRandomEvent();
+    }
+    
+    checkAchievements();
+    updateHUD();
+    checkGameState();
+    updateWeather();
+    
+    // Show year summary
+    showYearSummary(populationChange, gdpChange, happinessChange, unemploymentChange, budgetChange);
 }
 
-function setupThreeJS() {
-    scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x87CEEB, CONFIG.FOG_DENSITY);
+function showYearSummary(popChange, gdpChange, happinessChange, unempChange, budgetChange) {
+    const summary = [
+        `📅 YEAR ${gameState.year} REPORT`,
+        `💰 Budget: ${budgetChange > 0 ? '+' : ''}$${budgetChange.toLocaleString()}`,
+        `👥 Population: ${popChange > 0 ? '+' : ''}${popChange}`,
+        `📈 GDP: ${gdpChange > 0 ? '+' : ''}$${gdpChange.toLocaleString()}`,
+        `😊 Happiness: ${happinessChange > 0 ? '+' : ''}${happinessChange}%`,
+        `💼 Unemployment: ${unempChange > 0 ? '+' : ''}${unempChange.toFixed(1)}%`
+    ].join('\n');
     
-    canvas = document.querySelector('canvas.webgl');
-    
-    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
-    camera.position.set(0, 1.7, 10);
-    camera.rotation.order = 'YXZ';
-    
-    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    // renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.setClearColor(0x87CEEB);
-    
-    const ambientLight = new THREE.AmbientLight('#ffffff', 0.6);
-    scene.add(ambientLight);
-    
-    const directionalLight = new THREE.DirectionalLight('#ffffff', 0.9);
-    directionalLight.position.set(50, 100, 50);
-    directionalLight.castShadow = true;
-    directionalLight.shadow.mapSize.width = 2048;
-    directionalLight.shadow.mapSize.height = 2048;
-    scene.add(directionalLight);
-    
-    const hemisphereLight = new THREE.HemisphereLight(0x87CEEB, 0x4CAF50, 0.4);
-    scene.add(hemisphereLight);
+    showNotification(summary, 'info');
 }
 
+// Policy Management
+function togglePolicy(policyName) {
+    if (!gameState.started || gameState.paused) return;
+    
+    const cost = gameState.policyCosts[policyName];
+    const currentState = gameState.policies[policyName];
+    
+    if (!currentState && cost > gameState.budget) {
+        showNotification(`Insufficient Budget! Need $${cost}`, 'error');
+        return;
+    }
+    
+    gameState.policies[policyName] = !currentState;
+    
+    if (policyName === 'refugee' && !currentState) {
+        gameState.refugeeProgramStarted = gameState.year;
+        showNotification('🛡️ Refugee Program: Integration takes 2 years', 'info');
+    }
+    
+    const btn = document.querySelector(`[data-policy="${policyName}"]`);
+    if (gameState.policies[policyName]) {
+        btn.classList.add('active');
+        showNotification(`${formatPolicyName(policyName)} Enabled`, 'success');
+        gameState.budget -= cost;
+        spawnImmigrants(getImmigrantCount(policyName), policyName);
+    } else {
+        btn.classList.remove('active');
+        showNotification(`${formatPolicyName(policyName)} Disabled`, 'info');
+    }
+    
+    updateHUD();
+}
+
+function formatPolicyName(policyName) {
+    return policyName
+        .replace(/([A-Z])/g, ' $1')
+        .replace(/^./, str => str.toUpperCase());
+}
+
+function getImmigrantCount(policyName) {
+    const counts = {
+        openBorders: 6,
+        skilledWorker: 4,
+        refugee: 5,
+        family: 5,
+        investor: 2,
+        strict: 0
+    };
+    return counts[policyName] || 0;
+}
+
+// Random Events
+function triggerRandomEvent() {
+    const events = [
+        {
+            name: 'Economic Boom',
+            weight: 0.25,
+            effect: () => {
+                const bonus = Math.floor(Math.random() * 3000 + 2000);
+                gameState.gdp += bonus;
+                gameState.happiness += 5;
+                showNotification(`🚀 ECONOMIC BOOM! GDP +$${bonus.toLocaleString()}`, 'success');
+                createParticleEffect(camera.position, 0xffcc00, 25);
+            }
+        },
+        {
+            name: 'Natural Disaster',
+            weight: 0.2,
+            effect: () => {
+                const severity = Math.random();
+                let gdpLoss, happinessLoss, populationLoss, budgetCost;
+                
+                if (severity < 0.33) {
+                    gdpLoss = 1200;
+                    happinessLoss = 8;
+                    populationLoss = Math.floor(gameState.population * 0.002);
+                    budgetCost = 500;
+                    showNotification('🌧️ Minor Flooding!', 'error');
+                } else if (severity < 0.66) {
+                    gdpLoss = 2500;
+                    happinessLoss = 15;
+                    populationLoss = Math.floor(gameState.population * 0.005);
+                    budgetCost = 1000;
+                    showNotification('🌪️ Severe Storm!', 'error');
+                } else {
+                    gdpLoss = 5000;
+                    happinessLoss = 25;
+                    populationLoss = Math.floor(gameState.population * 0.01);
+                    budgetCost = 2000;
+                    showNotification('🔥 MAJOR EARTHQUAKE!', 'error');
+                }
+                
+                gameState.gdp -= gdpLoss;
+                gameState.happiness -= happinessLoss;
+                gameState.population = Math.max(100, gameState.population - populationLoss);
+                gameState.budget -= budgetCost;
+                
+                createParticleEffect(camera.position, 0xff0000, 30);
+                
+                if (populationLoss > 0) {
+                    showNotification(`💔 ${populationLoss.toLocaleString()} lives lost`, 'error');
+                }
+            }
+        },
+        {
+            name: 'Tech Breakthrough',
+            weight: 0.15,
+            effect: () => {
+                gameState.unemployment = Math.max(0, gameState.unemployment - 2.5);
+                gameState.gdp += 1500;
+                gameState.budget -= 300;
+                showNotification('💡 TECH BREAKTHROUGH!', 'success');
+                createParticleEffect(camera.position, 0x00ffff, 20);
+            }
+        },
+        {
+            name: 'Cultural Festival',
+            weight: 0.1,
+            effect: () => {
+                gameState.happiness += 12;
+                gameState.budget -= 200;
+                showNotification('🎭 CULTURAL FESTIVAL!', 'success');
+                createParticleEffect(camera.position, 0xff69b4, 18);
+            }
+        },
+        {
+            name: 'Trade War',
+            weight: 0.1,
+            effect: () => {
+                gameState.gdp -= 1800;
+                gameState.unemployment += 1.5;
+                showNotification('⚔️ TRADE WAR!', 'error');
+                createParticleEffect(camera.position, 0x8B0000, 15);
+            }
+        }
+    ];
+    
+    const totalWeight = events.reduce((sum, event) => sum + event.weight, 0);
+    let random = Math.random() * totalWeight;
+    
+    for (const event of events) {
+        if (random < event.weight) {
+            event.effect();
+            logEvent(event.name);
+            break;
+        }
+        random -= event.weight;
+    }
+}
+
+function logEvent(eventName) {
+    const eventLog = document.getElementById('eventLog');
+    if (eventLog) {
+        const entry = document.createElement('div');
+        entry.className = 'event-log-entry';
+        entry.textContent = `Year ${gameState.year}: ${eventName}`;
+        eventLog.prepend(entry);
+        
+        if (eventLog.children.length > 10) {
+            eventLog.removeChild(eventLog.lastChild);
+        }
+    }
+}
+
+// Achievement System
+function checkAchievements() {
+    const achievements = [
+        { condition: () => gameState.population >= 5000, name: 'Population Boom', id: 'pop_5000', icon: '👥' },
+        { condition: () => gameState.population >= 10000, name: 'Mega Nation', id: 'pop_10000', icon: '🏙️' },
+        { condition: () => gameState.gdp >= 25000, name: 'Economic Powerhouse', id: 'gdp_25000', icon: '💰' },
+        { condition: () => gameState.gdp >= 50000, name: 'Global Leader', id: 'gdp_50000', icon: '🌍' },
+        { condition: () => gameState.happiness >= 90, name: 'Utopia', id: 'happy_90', icon: '😊' },
+        { condition: () => gameState.unemployment <= 2, name: 'Full Employment', id: 'unemp_2', icon: '💼' },
+        { condition: () => gameState.year >= 2028, name: 'Decade of Progress', id: 'year_10', icon: '📅' },
+        { condition: () => gameState.score >= 10000, name: 'Master Builder', id: 'score_10k', icon: '⭐' }
+    ];
+    
+    achievements.forEach(achievement => {
+        if (!gameState.achievements.has(achievement.id) && achievement.condition()) {
+            gameState.achievements.add(achievement.id);
+            showAchievement(`${achievement.icon} ${achievement.name}!`);
+        }
+    });
+}
+
+function checkGameState() {
+    if (gameState.happiness <= 0) {
+        endGame('💔 Your nation collapsed due to extreme unhappiness!');
+    } else if (gameState.unemployment >= 40) {
+        endGame('📉 Economic collapse! Unemployment reached critical levels!');
+    } else if (gameState.budget < -15000) {
+        endGame('💸 Bankruptcy! The nation is in massive debt!');
+    } else if (gameState.population <= 500) {
+        endGame('⚠️ Population crisis! Not enough citizens!');
+    }
+}
+
+// ==============================================
+// SECTION 3: 3D WORLD & MODELS
+// ==============================================
+
+// Environment Creation
 function createScene() {
     const skyGeometry = new THREE.SphereGeometry(500, 32, 32);
     const skyMaterial = new THREE.MeshBasicMaterial({
@@ -272,10 +599,8 @@ function createGates() {
         gateGroup.add(rightPost);
         
         const archGeometry = new THREE.TorusGeometry(2.5, 0.25, 10, 40, Math.PI);
-        const archMaterial = new THREE.MeshStandardMaterial({ 
-            color: 0xFFD700,
-            emissive: 0xFFD700,
-            emissiveIntensity: 0.3
+        const archMaterial = new THREE.MeshBasicMaterial({ 
+            color: 0xFFD700
         });
         const arch = new THREE.Mesh(archGeometry, archMaterial);
         arch.position.set(0, 7, 0);
@@ -387,15 +712,15 @@ function createMonument() {
     interactiveObjects.push(monumentGroup);
 }
 
-function createInteractiveObjects() {
-    // Nothing for now
-}
-
+// People and Population Management
 function createInitialPopulation() {
-    for (let i = 0; i < 40; i++) {
+    // Create citizens distributed throughout the city
+    for (let i = 0; i < 20; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const radius = Math.random() * (CONFIG.CITY_RADIUS - 10);
         createPerson(
-            (Math.random() - 0.5) * 50,
-            (Math.random() - 0.5) * 50,
+            Math.cos(angle) * radius,
+            Math.sin(angle) * radius,
             'citizen'
         );
     }
@@ -405,68 +730,115 @@ function createPerson(x, z, type = 'citizen') {
     if (people.length >= CONFIG.MAX_PEOPLE) return null;
     
     const personGroup = new THREE.Group();
+    const color = getColorForType(type);
     
-    // First create a simple placeholder (cube) while loading
-    const placeholderGeometry = new THREE.BoxGeometry(0.6, 1.8, 0.6);
-    const placeholderMaterial = new THREE.MeshBasicMaterial({ 
-        color: 0xff0000,
-        transparent: true,
-        opacity: 0.5,
-        wireframe: true
-    });
-    const placeholder = new THREE.Mesh(placeholderGeometry, placeholderMaterial);
-    personGroup.add(placeholder);
+    // Create a simple geometric person shape
+    createGeometricPerson(personGroup, color);
     
     personGroup.position.set(x, 0.9, z);
+    
+    // Enhanced person data with roaming
     personGroup.userData = {
         type: 'person',
         personType: type,
-        walkSpeed: Math.random() * 0.025 + 0.01,
-        walkDirection: new THREE.Vector3(
-            Math.random() - 0.5, 0, Math.random() - 0.5
-        ).normalize(),
-        idleTime: 0,
-        isIdle: false,
-        animations: null,
-        mixer: null,
-        modelLoaded: false
+        destination: null,
+        reachedDestination: false,
+        walkTime: 0,
+        idleTime: Math.random() * 3,
+        isIdle: true,
+        walkSpeed: Math.random() * 0.02 + 0.01,
+        modelLoaded: true,
+        roamRadius: CONFIG.CITY_RADIUS - 5
     };
     
-    // Load the 3D model based on type
-    loadPersonModel(personGroup, type).then((loadedPerson) => {
-        if (loadedPerson) {
-            // Remove placeholder
-            personGroup.remove(placeholder);
-            
-            // Add the loaded model
-            scene.add(personGroup);
-            people.push(personGroup);
-            interactiveObjects.push(personGroup);
-            
-            // Add entry animation
-            personGroup.scale.set(0.1, 0.1, 0.1);
-            gsap.to(personGroup.scale, {
-                x: 1, y: 1, z: 1,
-                duration: 0.6,
-                ease: "back.out(1.7)"
-            });
-        }
-    }).catch(error => {
-        console.warn('Failed to load model, using placeholder:', error);
-        // Use the placeholder as fallback
-        placeholder.material.color.setHex(getColorForType(type));
-        placeholder.material.wireframe = false;
-        placeholder.material.opacity = 1;
-        
-        scene.add(personGroup);
-        people.push(personGroup);
-        interactiveObjects.push(personGroup);
-    });
+    scene.add(personGroup);
+    people.push(personGroup);
+    interactiveObjects.push(personGroup);
     
     return personGroup;
 }
 
-// Helper function to get colors for different types
+function createGeometricPerson(group, color) {
+    // Body (torso)
+    const bodyGeometry = new THREE.CylinderGeometry(0.2, 0.25, 0.7, 8);
+    const bodyMaterial = new THREE.MeshLambertMaterial({ color: color });
+    const body = new THREE.Mesh(bodyGeometry, bodyMaterial);
+    body.position.y = 0.7;
+    body.castShadow = true;
+    group.add(body);
+    
+    // Head
+    const headGeometry = new THREE.SphereGeometry(0.18, 8, 8);
+    const headMaterial = new THREE.MeshLambertMaterial({ 
+        color: 0xFFE0BD,
+        roughness: 0.8,
+        metalness: 0.2
+    });
+    const head = new THREE.Mesh(headGeometry, headMaterial);
+    head.position.y = 1.15;
+    head.castShadow = true;
+    group.add(head);
+    
+    // Arms
+    const armGeometry = new THREE.CylinderGeometry(0.06, 0.06, 0.5, 6);
+    const armMaterial = new THREE.MeshLambertMaterial({ color: color });
+    
+    // Left arm
+    const leftArm = new THREE.Mesh(armGeometry, armMaterial);
+    leftArm.position.set(-0.3, 0.7, 0);
+    leftArm.rotation.z = Math.PI / 6;
+    leftArm.castShadow = true;
+    group.add(leftArm);
+    
+    // Right arm
+    const rightArm = new THREE.Mesh(armGeometry, armMaterial);
+    rightArm.position.set(0.3, 0.7, 0);
+    rightArm.rotation.z = -Math.PI / 6;
+    rightArm.castShadow = true;
+    group.add(rightArm);
+    
+    // Legs
+    const legGeometry = new THREE.CylinderGeometry(0.08, 0.08, 0.5, 6);
+    const legMaterial = new THREE.MeshLambertMaterial({ 
+        color: 0x333333,
+        roughness: 0.9,
+        metalness: 0.1
+    });
+    
+    // Left leg
+    const leftLeg = new THREE.Mesh(legGeometry, legMaterial);
+    leftLeg.position.set(-0.1, 0.25, 0);
+    leftLeg.castShadow = true;
+    group.add(leftLeg);
+    
+    // Right leg
+    const rightLeg = new THREE.Mesh(legGeometry, legMaterial);
+    rightLeg.position.set(0.1, 0.25, 0);
+    rightLeg.castShadow = true;
+    group.add(rightLeg);
+    
+    // Face features (simple)
+    const eyeGeometry = new THREE.SphereGeometry(0.03, 4, 4);
+    const eyeMaterial = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    
+    // Left eye
+    const leftEye = new THREE.Mesh(eyeGeometry, eyeMaterial);
+    leftEye.position.set(-0.05, 1.17, 0.15);
+    group.add(leftEye);
+    
+    // Right eye
+    const rightEye = new THREE.Mesh(eyeGeometry, eyeMaterial);
+    rightEye.position.set(0.05, 1.17, 0.15);
+    group.add(rightEye);
+    
+    // Mouth (simple line)
+    const mouthGeometry = new THREE.BoxGeometry(0.08, 0.01, 0.02);
+    const mouthMaterial = new THREE.MeshBasicMaterial({ color: 0x000000 });
+    const mouth = new THREE.Mesh(mouthGeometry, mouthMaterial);
+    mouth.position.set(0, 1.1, 0.15);
+    group.add(mouth);
+}
+
 function getColorForType(type) {
     const colors = {
         citizen: 0x3498db,
@@ -480,249 +852,191 @@ function getColorForType(type) {
     return colors[type] || 0x3498db;
 }
 
-// Function to load 3D model
-// Function to load 3D model - MINIMAL FIX VERSION
-async function loadPersonModel(personGroup, personType) {
-    // Map person types to model files
-    const modelMap = {
-        citizen: './assets/models/male/scene.gltf',
-        openBorders: './assets/models/male/scene.gltf',
-        skilledWorker: './assets/models/male/scene.gltf',
-        refugee: './assets/models/male/scene.gltf',
-        family: './assets/models/male/scene.gltf',
-        investor: './assets/models/male/scene.gltf',
-        skilled: './assets/models/male/scene.gltf'
-    };
+// Enhanced Person Movement with Roaming
+function updatePersonMovement(person, delta) {
+    const data = person.userData;
     
-    const modelPath = './assets/models/male/scene.gltf';
-    
-    return new Promise((resolve, reject) => {
-        // Check cache first
-        if (modelCache[modelPath]) {
-            const model = modelCache[modelPath].clone();
-            setupModel(personGroup, model);
-            setupSimpleAnimations(personGroup, model); // SIMPLE version
-            resolve(personGroup);
+    if (data.isIdle) {
+        // IDLE STATE
+        data.idleTime -= delta;
+        person.position.y = 0.9 + Math.sin(clock.elapsedTime * 1.5) * 0.005;
+        
+        if (data.idleTime <= 0) {
+            // End idle, start walking
+            data.isIdle = false;
+            
+            // Pick a random destination within city bounds
+            const angle = Math.random() * Math.PI * 2;
+            const radius = Math.random() * data.roamRadius;
+            data.destination = new THREE.Vector3(
+                Math.cos(angle) * radius,
+                0.9,
+                Math.sin(angle) * radius
+            );
+            data.reachedDestination = false;
+            data.walkTime = 0;
+            
+            // Ensure destination is away from border
+            const distanceToCenter = Math.sqrt(
+                data.destination.x * data.destination.x + 
+                data.destination.z * data.destination.z
+            );
+            if (distanceToCenter > CONFIG.CITY_RADIUS) {
+                data.destination.multiplyScalar(CONFIG.CITY_RADIUS / distanceToCenter);
+            }
+        }
+    } else {
+        // WALKING STATE
+        if (!data.destination || data.reachedDestination) {
+            data.isIdle = true;
+            data.idleTime = Math.random() * 4 + 2;
             return;
         }
         
-        // Load the model
-        modelLoader.load(
-            modelPath,
-            (gltf) => {
-                // Cache the loaded model
-                modelCache[modelPath] = gltf.scene;
-                
-                // Clone the model for this person
-                const model = gltf.scene.clone();
-                
-                setupModel(personGroup, model);
-                
-                // Set up SIMPLE animations
-                setupSimpleAnimations(personGroup, model, gltf.animations);
-                
-                resolve(personGroup);
-            },
-            // Progress callback
-            (xhr) => {
-                const percentComplete = (xhr.loaded / xhr.total) * 100;
-                if (percentComplete % 25 < 1) {
-                    console.log(`${personType} model: ${percentComplete.toFixed(0)}% loaded`);
-                }
-            },
-            // Error callback
-            (error) => {
-                console.error('Error loading model:', error);
-                reject(error);
-            }
-        );
-    });
-}
-
-// SIMPLE animation setup that won't break your models
-function setupSimpleAnimations(personGroup, model, animations) {
-    if (!animations || animations.length === 0) {
-        console.log('No animations found');
-        return;
-    }
-    
-    console.log('Available animations:', animations.map(a => a.name).join(', '));
-    
-    // Create animation mixer
-    const mixer = new THREE.AnimationMixer(model);
-    personGroup.userData.mixer = mixer;
-    
-    // Try to find and play any walk animation
-    let walkAnimation = null;
-    
-    // Look for walk animations
-    for (const anim of animations) {
-        if (anim.name.toLowerCase().includes('walk')) {
-            walkAnimation = anim;
-            break;
-        }
-    }
-    
-    // If no walk animation found, use first animation
-    if (!walkAnimation) {
-        walkAnimation = animations[0];
-    }
-    
-    console.log('Using animation:', walkAnimation.name);
-    
-    // Create and play the animation
-    const action = mixer.clipAction(walkAnimation);
-    action.play();
-    
-    // Store reference
-    personGroup.userData.walkAction = action;
-}
-// Function to set up animations
-function setupAnimations(personGroup, model, animations) {
-    if (!animations || animations.length === 0) {
-        console.log('No animations found for this model');
-        return;
-    }
-    
-    console.log('Setting up animations...');
-    
-    // Create animation mixer
-    personGroup.userData.mixer = new THREE.AnimationMixer(model);
-    
-    // Find walking animation
-    let walkAnimation = null;
-    
-    // Try to find walk animation by name
-    const walkKeywords = ['walk', 'Walk', 'WALK', 'slow', 'Slow', 'Slow Walk', 'slow_walk'];
-    
-    for (const anim of animations) {
-        for (const keyword of walkKeywords) {
-            if (anim.name.includes(keyword)) {
-                walkAnimation = anim;
-                console.log(`Found walk animation: "${anim.name}"`);
-                break;
-            }
-        }
-        if (walkAnimation) break;
-    }
-    
-    // If no walk animation found, use the first animation
-    if (!walkAnimation) {
-        walkAnimation = animations[0];
-        console.log(`Using first animation: "${walkAnimation.name}"`);
-    }
-    
-    // Create and play the animation
-    const action = personGroup.userData.mixer.clipAction(walkAnimation);
-    action.play();
-    
-    console.log('Animation playing:', walkAnimation.name);
-    
-    // Store animation info for debugging
-    personGroup.userData.animationName = walkAnimation.name;
-    personGroup.userData.animationDuration = walkAnimation.duration;
-}
-// Add this debug function
-// function debugFilePaths() {
-//     console.log('Testing file paths...');
-//     console.log('Current working directory:', window.location.href);
-    
-//     // Test if the file exists
-//     const testPaths = [
-//         './assets/models/male/scene.gltf',
-//         'assets/models/male/scene.gltf',
-//         '/assets/models/male/scene.gltf',
-//         'models/male/scene.gltf'
-//     ];
-    
-//     testPaths.forEach(path => {
-//         fetch(path)
-//             .then(response => {
-//                 console.log(`✓ Path accessible: ${path}`);
-//             })
-//             .catch(error => {
-//                 console.log(`✗ Path not accessible: ${path}`);
-//             });
-//     });
-// }
-
-// Call this in your init or after DOM loads
-window.addEventListener('DOMContentLoaded', () => {
-    debugFilePaths(); // Add this line
-    initVRScene();
-    // ... rest of your code
-});
-// Function to set up the model
-// Function to set up the model with proper rotation and scaling
-function setupModel(personGroup, model) {
-    // Calculate the bounding box
-    const box = new THREE.Box3().setFromObject(model);
-    const size = box.getSize(new THREE.Vector3());
-    const center = box.getCenter(new THREE.Vector3());
-    
-    console.log('Model size:', size);
-    console.log('Model center:', center);
-    
-    // Calculate scale to make person ~1.8 units tall (human height)
-    const targetHeight = 1.8;
-    let scale;
-
-
-    scale = targetHeight / size.z;
-    
-    // Rotate model to stand up
-    model.rotation.x = Math.PI / 2;
-    
-    // Determine which axis is height (usually Y, but sometimes Z)
-    // if (size.y >= size.z && size.y >= size.x) {
-    //     // Model is standing up (Y is height)
-    //     scale = targetHeight / size.y;
-    // } else if (size.z >= size.y && size.z >= size.x) {
-    //     // Model is lying down (Z is height) - need to rotate
-    //     scale = targetHeight / size.z;
+        // Calculate direction to destination
+        const direction = new THREE.Vector3()
+            .subVectors(data.destination, person.position)
+            .normalize();
         
-    //     // Rotate model to stand up
-    //     model.rotation.x = Math.PI / 2; // Rotate 90 degrees
-    //     console.log('Rotated model to stand up');
-    // } else {
-    //     // Model is on its side (X is height) - need to rotate
-    //     scale = targetHeight / size.x;
+        // Move toward destination
+        const speed = data.walkSpeed;
+        person.position.x += direction.x * speed;
+        person.position.z += direction.z * speed;
         
-    //     // Rotate model to stand up
-    //     model.rotation.z = Math.PI / 2; // Rotate 90 degrees
-    //     console.log('Rotated model to stand up');
-    // }
-    
-    // Apply scale
-    model.scale.setScalar(scale * 0.8); // Slightly smaller for better fit
-    
-    // Center the model
-    model.position.sub(center.multiplyScalar(scale));
-    
-    // Position model at ground level
-    model.position.y =  -0.5  *scale; // Slightly above ground
-    
-    // Add to person group
-    personGroup.add(model);
-    
-    // Enable shadows
-    model.traverse((child) => {
-        if (child.isMesh) {
-            child.castShadow = true;
-            child.receiveShadow = true;
+        // Face walking direction
+        if (Math.abs(direction.x) > 0.01 || Math.abs(direction.z) > 0.01) {
+            const targetAngle = Math.atan2(direction.x, direction.z);
+            person.rotation.y = THREE.MathUtils.lerp(person.rotation.y, targetAngle, 0.1);
+        }
+        
+        // Walking bobbing animation
+        data.walkTime += delta;
+        person.position.y = 0.9 + Math.sin(data.walkTime * 8) * 0.02;
+        
+        // Simple arm swing animation for walking
+        if (person.children.length >= 6) { // Check if we have arms and legs
+            const leftArm = person.children[2];
+            const rightArm = person.children[3];
+            const leftLeg = person.children[4];
+            const rightLeg = person.children[5];
             
-            // Optional: Improve material appearance
-            if (child.material) {
-                child.material.roughness = 0.8;
-                child.material.metalness = 0.2;
+            const swingAmount = Math.sin(data.walkTime * 8) * 0.3;
+            leftArm.rotation.z = Math.PI / 6 + swingAmount;
+            rightArm.rotation.z = -Math.PI / 6 - swingAmount;
+            leftLeg.rotation.z = swingAmount * 0.5;
+            rightLeg.rotation.z = -swingAmount * 0.5;
+        }
+        
+        // Check if reached destination
+        const distanceToDestination = person.position.distanceTo(data.destination);
+        if (distanceToDestination < 1.0) {
+            data.reachedDestination = true;
+            data.isIdle = true;
+            data.idleTime = Math.random() * 3 + 1;
+            
+            // Reset arm positions when idle
+            if (person.children.length >= 6) {
+                const leftArm = person.children[2];
+                const rightArm = person.children[3];
+                const leftLeg = person.children[4];
+                const rightLeg = person.children[5];
+                
+                leftArm.rotation.z = Math.PI / 6;
+                rightArm.rotation.z = -Math.PI / 6;
+                leftLeg.rotation.z = 0;
+                rightLeg.rotation.z = 0;
             }
         }
-    });
-    
-    personGroup.userData.modelLoaded = true;
-    console.log('Model setup complete with scale:', scale);
+        
+        // Avoid buildings
+        buildings.forEach(building => {
+            const distance = person.position.distanceTo(building.position);
+            if (distance < 4) {
+                // Too close to building, move away
+                const awayDirection = new THREE.Vector3()
+                    .subVectors(person.position, building.position)
+                    .normalize();
+                person.position.x += awayDirection.x * 0.05;
+                person.position.z += awayDirection.z * 0.05;
+            }
+        });
+        
+        // Stay within city bounds
+        const distanceFromCenter = Math.sqrt(
+            person.position.x * person.position.x + 
+            person.position.z * person.position.z
+        );
+        
+        if (distanceFromCenter > CONFIG.CITY_RADIUS) {
+            // Push back toward center
+            const scale = CONFIG.CITY_RADIUS / distanceFromCenter;
+            person.position.x *= scale;
+            person.position.z *= scale;
+            
+            // Change direction
+            data.destination = new THREE.Vector3(
+                -person.position.x * 0.5,
+                0.9,
+                -person.position.z * 0.5
+            );
+        }
+    }
 }
 
+function spawnImmigrants(count, type) {
+    if (count === 0) return;
+    
+    const gate = gates[Math.floor(Math.random() * gates.length)];
+    const spawnCount = Math.min(count, 10);
+    
+    for (let i = 0; i < spawnCount; i++) {
+        const person = createPerson(
+            gate.position.x + (Math.random() - 0.5) * 3,
+            gate.position.z + (Math.random() - 0.5) * 3,
+            type
+        );
+        
+        if (person) {
+            // Spawn animation
+            person.scale.set(0.1, 0.1, 0.1);
+            gsap.to(person.scale, {
+                x: 1, y: 1, z: 1,
+                duration: 0.6,
+                ease: "back.out(1.7)"
+            });
+            
+            // Give them an initial destination away from gate
+            setTimeout(() => {
+                if (person.userData) {
+                    const angle = Math.random() * Math.PI * 2;
+                    const radius = Math.random() * (CONFIG.CITY_RADIUS - 10);
+                    person.userData.destination = new THREE.Vector3(
+                        Math.cos(angle) * radius,
+                        0.9,
+                        Math.sin(angle) * radius
+                    );
+                    person.userData.isIdle = false;
+                }
+            }, 1000);
+        }
+    }
+}
+
+// ==============================================
+// SECTION 4: UI & CONTROLS
+// ==============================================
+
+// Loading
+function updateLoadingProgress(step, message) {
+    loadingProgress = (step / 8) * 100;
+    document.getElementById('loadingProgress').style.width = `${loadingProgress}%`;
+    document.getElementById('loadingSubtitle').textContent = message;
+    document.getElementById('loadingObjects').textContent = Math.floor(50 + step * 20);
+    document.getElementById('loadingTextures').textContent = Math.floor(10 + step * 4);
+    document.getElementById('loadingModels').textContent = Math.floor(5 + step * 3);
+}
+
+// Mini-map
 function setupMiniMap() {
     const miniMapCanvas = document.getElementById('miniMapCanvas');
     miniMapCtx = miniMapCanvas.getContext('2d');
@@ -784,6 +1098,7 @@ function updateMiniMap() {
     ctx.stroke();
 }
 
+// Controls
 function setupControls() {
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('click', () => {
@@ -878,202 +1193,247 @@ function onWindowResize() {
     renderer.setSize(window.innerWidth, window.innerHeight);
 }
 
-function togglePolicy(policyName) {
-    if (!gameState.started || gameState.paused) return;
+// UI Updates
+function updateHUD() {
+    document.getElementById('statYear').textContent = gameState.year;
+    document.getElementById('statPopulation').textContent = gameState.population.toLocaleString();
+    document.getElementById('statGDP').textContent = '$' + gameState.gdp.toLocaleString();
+    document.getElementById('statHappiness').textContent = gameState.happiness.toFixed(0) + '%';
+    document.getElementById('statUnemployment').textContent = gameState.unemployment.toFixed(1) + '%';
+    document.getElementById('statBudget').textContent = '$' + gameState.budget.toLocaleString();
+    document.getElementById('statScore').textContent = gameState.score.toLocaleString();
+    document.getElementById('yearDisplay').textContent = gameState.year - 2023;
     
-    const cost = gameState.policyCosts[policyName];
-    const currentState = gameState.policies[policyName];
-    
-    if (!currentState && cost > gameState.budget) {
-        showNotification('Insufficient Budget!', 'error');
-        return;
-    }
-    
-    gameState.policies[policyName] = !currentState;
-    
-    const btn = document.querySelector(`[data-policy="${policyName}"]`);
-    if (gameState.policies[policyName]) {
-        btn.classList.add('active');
-        showNotification(`${formatPolicyName(policyName)} Enabled`, 'success');
-        gameState.budget -= cost;
-        spawnImmigrants(getImmigrantCount(policyName), policyName);
-    } else {
-        btn.classList.remove('active');
-        showNotification(`${formatPolicyName(policyName)} Disabled`, 'info');
-    }
-    
-    updateHUD();
-}
-
-function formatPolicyName(policyName) {
-    return policyName
-        .replace(/([A-Z])/g, ' $1')
-        .replace(/^./, str => str.toUpperCase());
-}
-
-function getImmigrantCount(policyName) {
-    const counts = {
-        openBorders: 60,
-        skilledWorker: 25,
-        refugee: 35,
-        family: 30,
-        investor: 12,
-        strict: 0
-    };
-    return counts[policyName] || 0;
-}
-
-function spawnImmigrants(count, type) {
-    if (count === 0) return;
-    
-    const gate = gates[Math.floor(Math.random() * gates.length)];
-    const spawnCount = Math.min(Math.ceil(count / 6), 5);
-    
-    for (let i = 0; i < spawnCount; i++) {
-        const person = createPerson(
-            gate.position.x + (Math.random() - 0.5) * 4,
-            gate.position.z + (Math.random() - 0.5) * 4,
-            type
-        );
+    // Happiness bar
+    const happinessBar = document.getElementById('happinessBar');
+    if (happinessBar) {
+        happinessBar.style.width = `${gameState.happiness}%`;
         
-        if (person) {
-            person.scale.set(0.1, 0.1, 0.1);
-            gsap.to(person.scale, {
-                x: 1, y: 1, z: 1,
-                duration: 0.6,
-                ease: "back.out(1.7)"
-            });
+        if (gameState.happiness < 30) {
+            happinessBar.style.background = 'linear-gradient(90deg, #ff0000, #ff6b6b)';
+        } else if (gameState.happiness > 70) {
+            happinessBar.style.background = 'linear-gradient(90deg, #00ff88, #51cf66)';
+        } else {
+            happinessBar.style.background = 'linear-gradient(90deg, #ffcc00, #ffd700)';
+        }
+    }
+    
+    // Year progress
+    const now = Date.now();
+    const elapsed = now - lastSimulationTime;
+    const progress = Math.min(100, (elapsed / CONFIG.SIMULATION_INTERVAL) * 100);
+    const yearProgress = document.getElementById('yearProgress');
+    if (yearProgress) {
+        yearProgress.style.height = `${progress}%`;
+    }
+}
+
+function updateWeather() {
+    const weathers = ['☀️', '⛅', '☁️', '🌧️'];
+    const weatherIndicator = document.getElementById('weatherIndicator');
+    if (Math.random() < 0.3) {
+        weatherIndicator.textContent = weathers[Math.floor(Math.random() * weathers.length)];
+    }
+}
+
+// Notifications
+function showNotification(message, type = 'info') {
+    const notification = document.getElementById('notification');
+    notification.textContent = message;
+    notification.classList.add('show');
+    
+    const colors = {
+        success: '#00ff88',
+        error: '#ff6b6b',
+        info: '#00d4ff',
+        achievement: '#FFD700'
+    };
+    
+    notification.style.borderColor = colors[type] || colors.info;
+    notification.style.color = colors[type] || colors.info;
+    
+    setTimeout(() => {
+        notification.classList.remove('show');
+    }, 3500);
+}
+
+function showAchievement(message) {
+    const achievement = document.getElementById('achievement');
+    achievement.textContent = `🏆 ${message}`;
+    achievement.classList.add('show');
+    
+    setTimeout(() => {
+        achievement.classList.remove('show');
+    }, 4000);
+}
+
+// Tooltips
+function showTooltip(card) {
+    const descriptions = {
+        openBorders: 'Allows unrestricted immigration. +60 people, +$1200 GDP, -12% happiness, +2.5% unemployment. Cost: $700/year.',
+        skilledWorker: 'Attracts educated professionals. +20 people, +$2200 GDP, -1.2% unemployment, -5% happiness. Risk: Brain drain. Cost: $600/year.',
+        refugee: 'Provides asylum to refugees. +30 people, +8% happiness, -$400 GDP short-term, +1.5% unemployment. Benefits start after 2 years. Cost: $900/year.',
+        family: 'Allows family reunification. +25 people, +15% happiness, -$300 GDP (dependents). May cause baby boom. Cost: $400/year.',
+        investor: 'Attracts wealthy investors. +8 people, +$1800 GDP, -0.8% unemployment, YOU GET $1500. But -8% happiness. Risk: Corruption. Cost: -$1500 (they pay you).',
+        strict: 'Enforces strict immigration controls. Reduces ALL immigration by 50%, +20% happiness, -1% GDP, population declines naturally. Cost: $300/year.'
+    };
+    
+    const policy = card.dataset.policy;
+    const tooltip = document.getElementById('tooltip');
+    tooltip.innerHTML = `
+        <div style="color: #00d4ff; font-size: 16px; margin-bottom: 8px; font-weight: bold;">${formatPolicyName(policy)}</div>
+        <div style="color: #aaa; font-size: 13px; line-height: 1.5;">${descriptions[policy] || ''}</div>
+    `;
+    tooltip.style.opacity = '1';
+    tooltip.style.left = (event.clientX + 20) + 'px';
+    tooltip.style.top = (event.clientY + 20) + 'px';
+}
+
+function hideTooltip() {
+    const tooltip = document.getElementById('tooltip');
+    tooltip.style.opacity = '0';
+}
+
+// Interactions
+function interactWithObject() {
+    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
+    const intersects = raycaster.intersectObjects(interactiveObjects);
+    
+    if (intersects.length > 0 && intersects[0].distance < 6) {
+        const object = intersects[0].object.parent?.userData ? intersects[0].object.parent : intersects[0].object;
+        const userData = object.userData;
+        
+        if (userData.interactive) {
+            showNotification(`📍 ${userData.name}`, 'info');
+            
+            if (userData.type === 'person') {
+                showNotification(`Met a ${userData.personType} immigrant`, 'info');
+            }
         }
     }
 }
 
-function simulateYear() {
-    if (!gameState.started || gameState.paused) return;
+// Game Management
+function startGame() {
+    gameState.started = true;
+    gameState.paused = false;
+    gameState.budget = gameState.difficultySettings[gameState.difficulty].budget + CONFIG.INITIAL_BUDGET;
     
-    gameState.year++;
+    document.getElementById('vrMenu').classList.remove('active');
     
-    let totalImmigrants = 0;
-    Object.keys(gameState.policies).forEach(policy => {
-        if (gameState.policies[policy]) {
-            totalImmigrants += getImmigrantCount(policy);
-        }
-    });
-    
-    if (gameState.policies.strict) {
-        totalImmigrants = Math.floor(totalImmigrants * 0.5);
+    // Show event log
+    const eventLogPanel = document.getElementById('eventLogPanel');
+    if (eventLogPanel) {
+        eventLogPanel.style.display = 'block';
     }
     
-    gameState.population += totalImmigrants;
-    
-    const difficulty = gameState.difficultySettings[gameState.difficulty];
-    let gdpChange = 0;
-    
-    if (gameState.policies.skilledWorker) gdpChange += 2500 * difficulty.gdpMultiplier;
-    if (gameState.policies.investor) gdpChange += 3500 * difficulty.gdpMultiplier;
-    if (gameState.policies.openBorders) gdpChange += Math.random() > 0.4 ? 1200 : -600;
-    if (gameState.policies.strict) gdpChange -= 1000;
-    
-    gdpChange += Math.floor(gameState.population / 80) * difficulty.gdpMultiplier;
-    gdpChange += Math.floor(Math.random() * 800 - 400);
-    
-    gameState.gdp = Math.max(1000, gameState.gdp + Math.floor(gdpChange));
-    
-    let happinessChange = -difficulty.happinessDrain;
-    
-    if (gameState.policies.family) happinessChange += 6;
-    if (gameState.policies.refugee) happinessChange += 4;
-    if (gameState.policies.strict) happinessChange -= 6;
-    if (gameState.unemployment > 15) happinessChange -= 5;
-    if (gameState.gdp > 15000) happinessChange += 4;
-    
-    gameState.happiness = Math.max(0, Math.min(100, 
-        gameState.happiness + happinessChange
-    ));
-    
-    let unempChange = (totalImmigrants / 180) * difficulty.unempMultiplier;
-    if (gameState.policies.skilledWorker) unempChange -= 1.5;
-    if (gameState.policies.investor) unempChange -= 1.0;
-    if (gameState.policies.refugee) unempChange += 0.7;
-    
-    gameState.unemployment = Math.max(0, Math.min(40, 
-        gameState.unemployment + unempChange
-    ));
-    
-    const newScore = Math.floor(
-        (gameState.population / 80) + 
-        (gameState.gdp / 80) + 
-        (gameState.happiness * 2.5) - 
-        (gameState.unemployment * 12)
-    );
-    
-    gameState.score += Math.max(0, newScore);
-    gameState.budget += Math.floor(gameState.gdp / 3.5);
-    
-    if (Math.random() < 0.18) {
-        triggerRandomEvent();
+    if (!document.pointerLockElement) {
+        document.body.requestPointerLock();
     }
     
-    checkAchievements();
+    showNotification('🎮 Welcome to Nation Builder VR! Make tough policy choices!', 'info');
     updateHUD();
-    checkGameState();
-    updateWeather();
 }
 
-function triggerRandomEvent() {
-    const events = [
-        {
-            name: 'Economic Boom',
-            weight: 0.4,
-            effect: () => {
-                const bonus = Math.floor(Math.random() * 2500 + 1500);
-                gameState.gdp += bonus;
-                showNotification(`🚀 Economic Boom! GDP +${bonus.toLocaleString()}`, 'success');
-                createParticleEffect(camera.position, 0xffcc00, 20);
-            }
-        },
-        {
-            name: 'Natural Disaster',
-            weight: 0.25,
-            effect: () => {
-                gameState.happiness -= 10;
-                gameState.gdp -= 800;
-                showNotification('⚠️ Natural Disaster! Resources depleted', 'error');
-                createParticleEffect(camera.position, 0xff0000, 15);
-            }
-        },
-        {
-            name: 'Tech Breakthrough',
-            weight: 0.25,
-            effect: () => {
-                gameState.unemployment = Math.max(0, gameState.unemployment - 2);
-                gameState.gdp += 600;
-                showNotification('💡 Tech Breakthrough! Innovation thrives', 'success');
-                createParticleEffect(camera.position, 0x00ffff, 18);
-            }
-        },
-        {
-            name: 'Cultural Festival',
-            weight: 0.1,
-            effect: () => {
-                gameState.happiness += 8;
-                showNotification('🎭 Cultural Festival! Happiness rises', 'success');
-                createParticleEffect(camera.position, 0xff69b4, 15);
-            }
-        }
-    ];
+function endGame(reason) {
+    gameState.started = false;
+    gameState.paused = true;
     
-    const totalWeight = events.reduce((sum, event) => sum + event.weight, 0);
-    let random = Math.random() * totalWeight;
-    
-    for (const event of events) {
-        if (random < event.weight) {
-            event.effect();
-            break;
+    const menu = document.getElementById('vrMenu');
+    menu.innerHTML = `
+        <div class="menu-title">GAME OVER</div>
+        <div style="color: #ff6b6b; font-size: 18px; text-align: center; margin-bottom: 20px;">
+            ${reason}
+        </div>
+        <div style="color: #aaa; margin-bottom: 30px; text-align: center; line-height: 1.8;">
+            <p><strong>Years Survived:</strong> ${gameState.year - 2023}</p>
+            <p><strong>Final Population:</strong> ${gameState.population.toLocaleString()}</p>
+            <p><strong>Final GDP:</strong> $${gameState.gdp.toLocaleString()}</p>
+            <p><strong>Final Happiness:</strong> ${gameState.happiness.toFixed(0)}%</p>
+            <p><strong>Final Score:</strong> ${gameState.score.toLocaleString()}</p>
+            <p><strong>Achievements:</strong> ${gameState.achievements.size}/8</p>
+        </div>
+        <button class="menu-button" onclick="restartGame()">🔄 RESTART GAME</button>
+    `;
+    menu.classList.add('active');
+    document.exitPointerLock();
+}
+
+function restartGame() {
+    location.reload();
+}
+
+function showTutorial() {
+    alert(`
+NATION BUILDER VR - ENHANCED TUTORIAL
+
+CONTROLS:
+• WASD - Move around the world
+• Mouse - Look around (click to lock)
+• SPACE - Jump
+• E - Interact with objects
+• TAB - Open/close menu
+• P - Pause game
+• 1-6 - Quick policy toggle
+
+GAMEPLAY:
+• Manage immigration policies to grow your nation
+• Each policy has TRADE-OFFS - nothing is free!
+• Balance population, GDP, happiness, and unemployment
+• Random events can help or hinder your progress
+• Don't run out of budget or let metrics crash
+• Survive as long as possible and earn achievements
+
+POLICY TRADE-OFFS:
+🌐 Open Borders - Many immigrants, GDP boost, but hurts happiness
+💼 Skilled Workers - High GDP, but expensive and causes resentment
+🛡️ Refugee Program - Humanitarian, but costly short-term
+👨‍👩‍👧‍👦 Family Reunion - Great for happiness, but economic strain
+💰 Investor Visa - Immediate cash, but inequality and corruption risk
+🚫 Strict Control - Security and happiness, but economic decline
+
+ACHIEVEMENTS:
+Unlock 8 special achievements by reaching milestones!
+
+Good luck building your nation!
+    `);
+}
+
+function showStats() {
+    const achievementList = Array.from(gameState.achievements).join(', ') || 'None yet';
+    alert(`
+CURRENT STATISTICS
+
+Year: ${gameState.year}
+Population: ${gameState.population.toLocaleString()}
+GDP: $${gameState.gdp.toLocaleString()}
+Happiness: ${gameState.happiness.toFixed(1)}%
+Unemployment: ${gameState.unemployment.toFixed(1)}%
+Budget: $${gameState.budget.toLocaleString()}
+Score: ${gameState.score.toLocaleString()}
+
+Difficulty: ${gameState.difficulty.toUpperCase()}
+Achievements: ${gameState.achievements.size}/8
+
+Active Policies:
+${Object.keys(gameState.policies).filter(p => gameState.policies[p]).map(p => '• ' + formatPolicyName(p)).join('\n') || '• None'}
+    `);
+}
+
+function toggleMenu() {
+    const menu = document.getElementById('vrMenu');
+    if (menu.classList.contains('active')) {
+        menu.classList.remove('active');
+        if (gameState.started && !gameState.paused) {
+            document.body.requestPointerLock();
         }
-        random -= event.weight;
+    } else {
+        menu.classList.add('active');
+        document.exitPointerLock();
     }
 }
 
+// Particle Effects
 function createParticleEffect(position, color, count) {
     const particleGeometry = new THREE.BufferGeometry();
     const positions = new Float32Array(count * 3);
@@ -1123,404 +1483,78 @@ function createParticleEffect(position, color, count) {
     });
 }
 
-function checkAchievements() {
-    const achievements = [
-        { condition: () => gameState.population >= 5000, name: 'Population Boom', id: 'pop_5000', icon: '👥' },
-        { condition: () => gameState.population >= 10000, name: 'Mega Nation', id: 'pop_10000', icon: '🏙️' },
-        { condition: () => gameState.gdp >= 25000, name: 'Economic Powerhouse', id: 'gdp_25000', icon: '💰' },
-        { condition: () => gameState.gdp >= 50000, name: 'Global Leader', id: 'gdp_50000', icon: '🌍' },
-        { condition: () => gameState.happiness >= 90, name: 'Utopia', id: 'happy_90', icon: '😊' },
-        { condition: () => gameState.unemployment <= 2, name: 'Full Employment', id: 'unemp_2', icon: '💼' },
-        { condition: () => gameState.year >= 2028, name: 'Decade of Progress', id: 'year_10', icon: '📅' },
-        { condition: () => gameState.score >= 10000, name: 'Master Builder', id: 'score_10k', icon: '⭐' }
-    ];
+// ==============================================
+// SECTION 5: INITIALIZATION & MAIN LOOP
+// ==============================================
+
+function setupThreeJS() {
+    scene = new THREE.Scene();
+    scene.fog = new THREE.FogExp2(0x87CEEB, CONFIG.FOG_DENSITY);
     
-    achievements.forEach(achievement => {
-        if (!gameState.achievements.has(achievement.id) && achievement.condition()) {
-            gameState.achievements.add(achievement.id);
-            showAchievement(`${achievement.icon} ${achievement.name}!`);
-        }
-    });
+    canvas = document.querySelector('canvas.webgl');
+    
+    camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+    camera.position.set(0, 1.7, 10);
+    camera.rotation.order = 'YXZ';
+    
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.setClearColor(0x87CEEB);
+    
+    const ambientLight = new THREE.AmbientLight('#ffffff', 0.6);
+    scene.add(ambientLight);
+    
+    const directionalLight = new THREE.DirectionalLight('#ffffff', 0.9);
+    directionalLight.position.set(50, 100, 50);
+    directionalLight.castShadow = true;
+    directionalLight.shadow.mapSize.width = 2048;
+    directionalLight.shadow.mapSize.height = 2048;
+    scene.add(directionalLight);
+    
+    const hemisphereLight = new THREE.HemisphereLight(0x87CEEB, 0x4CAF50, 0.4);
+    scene.add(hemisphereLight);
 }
 
-function checkGameState() {
-    if (gameState.happiness <= 0) {
-        endGame('💔 Your nation collapsed due to extreme unhappiness!');
-    } else if (gameState.unemployment >= 40) {
-        endGame('📉 Economic collapse! Unemployment reached critical levels!');
-    } else if (gameState.budget < -15000) {
-        endGame('💸 Bankruptcy! The nation is in massive debt!');
-    } else if (gameState.population <= 100) {
-        endGame('⚠️ Population crisis! Not enough citizens!');
-    }
-}
-
-function updateWeather() {
-    const weathers = ['☀️', '⛅', '☁️', '🌧️'];
-    const weatherIndicator = document.getElementById('weatherIndicator');
-    if (Math.random() < 0.3) {
-        weatherIndicator.textContent = weathers[Math.floor(Math.random() * weathers.length)];
-    }
-}
-
-function updateHUD() {
-    document.getElementById('statYear').textContent = gameState.year;
-    document.getElementById('statPopulation').textContent = gameState.population.toLocaleString();
-    document.getElementById('statGDP').textContent = 
-        + gameState.gdp.toLocaleString();
-    document.getElementById('statHappiness').textContent = gameState.happiness.toFixed(0) + '%';
-    document.getElementById('statUnemployment').textContent = gameState.unemployment.toFixed(1) + '%';
-    document.getElementById('statBudget').textContent = 
-        + gameState.budget.toLocaleString();
-    document.getElementById('statScore').textContent = gameState.score.toLocaleString();
-    document.getElementById('yearDisplay').textContent = gameState.year - 2023;
+function initVRScene() {
+    updateLoadingProgress(1, 'Initializing graphics engine...');
+    setupThreeJS();
     
-    const happinessBar = document.getElementById('happinessBar');
-    if (happinessBar) {
-        happinessBar.style.width = `${gameState.happiness}%`;
-        
-        if (gameState.happiness < 30) {
-            happinessBar.style.background = 'linear-gradient(90deg, #ff0000, #ff6b6b)';
-        } else if (gameState.happiness > 70) {
-            happinessBar.style.background = 'linear-gradient(90deg, #00ff88, #51cf66)';
-        } else {
-            happinessBar.style.background = 'linear-gradient(90deg, #ffcc00, #ffd700)';
-        }
-    }
+    updateLoadingProgress(2, 'Creating environment...');
+    createScene();
     
-    const now = Date.now();
-    const elapsed = now - lastSimulationTime;
-    const progress = Math.min(100, (elapsed / CONFIG.SIMULATION_INTERVAL) * 100);
-    const yearProgress = document.getElementById('yearProgress');
-    if (yearProgress) {
-        yearProgress.style.height = `${progress}%`;
-    }
-}
-
-function showNotification(message, type = 'info') {
-    const notification = document.getElementById('notification');
-    notification.textContent = message;
-    notification.classList.add('show');
+    updateLoadingProgress(3, 'Building terrain...');
+    createGround();
     
-    const colors = {
-        success: '#00ff88',
-        error: '#ff6b6b',
-        info: '#00d4ff',
-        achievement: '#FFD700'
-    };
+    updateLoadingProgress(4, 'Constructing border...');
+    createBorder();
+    createGates();
     
-    notification.style.borderColor = colors[type] || colors.info;
-    notification.style.color = colors[type] || colors.info;
+    updateLoadingProgress(5, 'Generating city...');
+    createBuildings();
+    
+    updateLoadingProgress(6, 'Adding landmarks...');
+    createMonument();
+    
+    updateLoadingProgress(7, 'Populating world...');
+    createInitialPopulation();
+    
+    updateLoadingProgress(8, 'Finalizing...');
+    setupControls();
+    setupMiniMap();
+    animate();
     
     setTimeout(() => {
-        notification.classList.remove('show');
-    }, 3500);
+        document.getElementById('loadingScreen').classList.add('fade-out');
+        setTimeout(() => {
+            document.getElementById('loadingScreen').style.display = 'none';
+            document.getElementById('vrMenu').classList.add('active');
+        }, 1000);
+    }, 500);
 }
 
-function showAchievement(message) {
-    const achievement = document.getElementById('achievement');
-    achievement.textContent = `🏆 ${message}`;
-    achievement.classList.add('show');
-    
-    setTimeout(() => {
-        achievement.classList.remove('show');
-    }, 4000);
-}
-
-function showTooltip(card) {
-    const descriptions = {
-        openBorders: 'Allows unrestricted immigration. High volume, mixed economic impact.',
-        skilledWorker: 'Attracts educated professionals. Major GDP boost, reduces unemployment.',
-        refugee: 'Provides asylum to refugees. Humanitarian choice with moderate costs.',
-        family: 'Allows family reunification. Greatly increases happiness and stability.',
-        investor: 'Attracts wealthy investors. Significant budget and GDP increases.',
-        strict: 'Enforces strict immigration controls. Reduces immigration flow by 50%.'
-    };
-    
-    const policy = card.dataset.policy;
-    const tooltip = document.getElementById('tooltip');
-    tooltip.innerHTML = `
-        <div style="color: #00d4ff; font-size: 16px; margin-bottom: 8px; font-weight: bold;">${formatPolicyName(policy)}</div>
-        <div style="color: #aaa; font-size: 13px; line-height: 1.5;">${descriptions[policy] || ''}</div>
-    `;
-    tooltip.style.opacity = '1';
-    tooltip.style.left = (event.clientX + 20) + 'px';
-    tooltip.style.top = (event.clientY + 20) + 'px';
-}
-
-function hideTooltip() {
-    const tooltip = document.getElementById('tooltip');
-    tooltip.style.opacity = '0';
-}
-
-function startGame() {
-    gameState.started = true;
-    gameState.paused = false;
-    gameState.budget = gameState.difficultySettings[gameState.difficulty].budget + CONFIG.INITIAL_BUDGET;
-    
-    document.getElementById('vrMenu').classList.remove('active');
-    
-    if (!document.pointerLockElement) {
-        document.body.requestPointerLock();
-    }
-    
-    showNotification('🎮 Welcome to Nation Builder VR!', 'info');
-    updateHUD();
-}
-
-function endGame(reason) {
-    gameState.started = false;
-    gameState.paused = true;
-    
-    const menu = document.getElementById('vrMenu');
-    menu.innerHTML = `
-        <div class="menu-title">GAME OVER</div>
-        <div style="color: #ff6b6b; font-size: 18px; text-align: center; margin-bottom: 20px;">
-            ${reason}
-        </div>
-        <div style="color: #aaa; margin-bottom: 30px; text-align: center; line-height: 1.8;">
-            <p><strong>Years Survived:</strong> ${gameState.year - 2023}</p>
-            <p><strong>Final Population:</strong> ${gameState.population.toLocaleString()}</p>
-            <p><strong>Final GDP:</strong> ${gameState.gdp.toLocaleString()}</p>
-            <p><strong>Final Happiness:</strong> ${gameState.happiness.toFixed(0)}%</p>
-            <p><strong>Final Score:</strong> ${gameState.score.toLocaleString()}</p>
-            <p><strong>Achievements:</strong> ${gameState.achievements.size}/8</p>
-        </div>
-        <button class="menu-button" onclick="restartGame()">🔄 RESTART GAME</button>
-    `;
-    menu.classList.add('active');
-    document.exitPointerLock();
-}
-
-function restartGame() {
-    location.reload();
-}
-
-function showTutorial() {
-    alert(`
-NATION BUILDER VR - ENHANCED TUTORIAL
-
-CONTROLS:
-• WASD - Move around the world
-• Mouse - Look around (click to lock)
-• SPACE - Jump
-• E - Interact with objects
-• TAB - Open/close menu
-• P - Pause game
-• 1-6 - Quick policy toggle
-
-GAMEPLAY:
-• Manage immigration policies to grow your nation
-• Balance population, GDP, happiness, and unemployment
-• Each policy has unique effects on your nation
-• Random events can help or hinder your progress
-• Don't run out of budget or let metrics crash
-• Survive as long as possible and earn achievements
-
-DIFFICULTY LEVELS:
-• Easy: More budget, slower happiness drain
-• Medium: Balanced challenge
-• Hard: Limited budget, rapid changes
-
-POLICIES EXPLAINED:
-🌐 Open Borders - Many immigrants, unpredictable effects
-💼 Skilled Workers - Boosts GDP, reduces unemployment
-🛡️ Refugee Program - Humanitarian, moderate cost
-👨‍👩‍👧‍👦 Family Reunion - Increases happiness significantly
-💰 Investor Visa - Wealthy immigrants, high GDP boost
-🚫 Strict Control - Reduces immigration by 50%
-
-ACHIEVEMENTS:
-Unlock 8 special achievements by reaching milestones!
-
-Good luck building your nation!
-    `);
-}
-
-function showStats() {
-    const achievementList = Array.from(gameState.achievements).join(', ') || 'None yet';
-    alert(`
-CURRENT STATISTICS
-
-Year: ${gameState.year}
-Population: ${gameState.population.toLocaleString()}
-GDP: ${gameState.gdp.toLocaleString()}
-Happiness: ${gameState.happiness.toFixed(1)}%
-Unemployment: ${gameState.unemployment.toFixed(1)}%
-Budget: ${gameState.budget.toLocaleString()}
-Score: ${gameState.score.toLocaleString()}
-
-Difficulty: ${gameState.difficulty.toUpperCase()}
-Achievements: ${gameState.achievements.size}/8
-
-Active Policies:
-${Object.keys(gameState.policies).filter(p => gameState.policies[p]).map(p => '• ' + formatPolicyName(p)).join('\n') || '• None'}
-    `);
-}
-
-function toggleMenu() {
-    const menu = document.getElementById('vrMenu');
-    if (menu.classList.contains('active')) {
-        menu.classList.remove('active');
-        if (gameState.started && !gameState.paused) {
-            document.body.requestPointerLock();
-        }
-    } else {
-        menu.classList.add('active');
-        document.exitPointerLock();
-    }
-}
-
-function interactWithObject() {
-    raycaster.setFromCamera(new THREE.Vector2(0, 0), camera);
-    const intersects = raycaster.intersectObjects(interactiveObjects);
-    
-    if (intersects.length > 0 && intersects[0].distance < 6) {
-        const object = intersects[0].object.parent?.userData ? intersects[0].object.parent : intersects[0].object;
-        const userData = object.userData;
-        
-        if (userData.interactive) {
-            showNotification(`📍 ${userData.name}`, 'info');
-            
-            if (userData.type === 'person') {
-                showNotification(`Met a ${userData.personType} immigrant`, 'info');
-            }
-        }
-    }
-}
-function updateObjects(delta) {
-    const elapsedTime = clock.getElapsedTime();
-    
-    if (monument) {
-        monument.rotation.y = elapsedTime * 0.12;
-    }
-    
-    // Update animation mixers for all people FIRST
-    people.forEach((person) => {
-        if (person.userData.mixer) {
-            person.userData.mixer.update(delta);
-        }
-    });
-    
-    // Now update positions and behavior
-    people.forEach((person, index) => {
-        const data = person.userData;
-        
-        if (data.isIdle) {
-            // IDLE STATE - standing still
-            data.idleTime += delta;
-            
-            // Subtle idle breathing animation
-            person.position.y = 0.9 + Math.sin(elapsedTime * 1.5 + index) * 0.005;
-            
-            // End idle period and start walking
-            if (data.idleTime > 2 + Math.random() * 3) {
-                data.isIdle = false;
-                data.idleTime = 0;
-                data.walkDirection.set(
-                    Math.random() - 0.5, 
-                    0, 
-                    Math.random() - 0.5
-                ).normalize();
-                
-                // Start walk animation if available
-                if (data.walkAction && data.walkAction.paused) {
-                    data.walkAction.play();
-                    data.walkAction.timeScale = 1.0; // Normal walking speed
-                }
-                
-                // Pause idle animation if available
-                if (data.idleAction && !data.idleAction.paused) {
-                    data.idleAction.pause();
-                }
-            }
-            
-        } else {
-            // WALKING STATE - moving around
-            
-            // Calculate movement (this is what makes them actually move forward)
-            const walkDistance = 0.03; // Adjust this value to control walking speed
-            person.position.x += data.walkDirection.x * walkDistance;
-            person.position.z += data.walkDirection.z * walkDistance;
-            
-            // Make person face walking direction
-            if (Math.abs(data.walkDirection.x) > 0.01 || Math.abs(data.walkDirection.z) > 0.01) {
-                const targetAngle = Math.atan2(data.walkDirection.x, data.walkDirection.z);
-                person.rotation.y = targetAngle;
-            }
-            
-            // Walking bobbing motion
-            person.position.y = 0.9 + Math.sin(elapsedTime * 8 + index) * 0.02;
-            
-            // Check if person hits the border
-            const distanceFromCenter = Math.sqrt(
-                person.position.x * person.position.x + 
-                person.position.z * person.position.z
-            );
-            
-            if (distanceFromCenter > CONFIG.BORDER_RADIUS - 4) {
-                // Hit border - bounce back
-                data.walkDirection.multiplyScalar(-0.7); // Reverse and slow down
-                data.walkDirection.normalize();
-                
-                // Add some random angle variation
-                const randomAngle = (Math.random() - 0.5) * Math.PI / 3;
-                const currentAngle = Math.atan2(data.walkDirection.x, data.walkDirection.z);
-                const newAngle = currentAngle + randomAngle;
-                
-                data.walkDirection.set(
-                    Math.sin(newAngle),
-                    0,
-                    Math.cos(newAngle)
-                ).normalize();
-                
-                // Briefly go idle
-                data.isIdle = true;
-                data.idleTime = Math.random() * 1.5;
-            }
-            
-            // Random chance to switch to idle
-            if (Math.random() < 0.002) {
-                data.isIdle = true;
-                data.idleTime = Math.random() * 2 + 1;
-            }
-        }
-        
-        // Keep within bounds (safety check)
-        const maxDistance = CONFIG.BORDER_RADIUS - 3;
-        const currentDistance = Math.sqrt(person.position.x ** 2 + person.position.z ** 2);
-        if (currentDistance > maxDistance) {
-            const scale = maxDistance / currentDistance;
-            person.position.x *= scale;
-            person.position.z *= scale;
-        }
-    });
-    
-    // Update building animations
-    buildings.forEach((building, index) => {
-        building.rotation.y = Math.sin(elapsedTime * 0.1 + index) * 0.002;
-    });
-}
-// Fix skinned mesh warnings
-// function fixSkinnedMeshWarnings(model) {
-//     model.traverse((child) => {
-//         if (child.isSkinnedMesh && child.material) {
-//             // Enable skinning for the material (CRITICAL for animations)
-//             child.material.skinning = true;
-            
-//             // Disable shadows to avoid warnings
-//             child.castShadow = false;
-//             child.receiveShadow = false;
-            
-//             // If material is an array (multiple materials)
-//             if (Array.isArray(child.material)) {
-//                 child.material.forEach(mat => {
-//                     mat.skinning = true;
-//                 });
-//             }
-//         }
-//     });
-// }
+// Main animation loop
 function animate() {
     requestAnimationFrame(animate);
     
@@ -1538,11 +1572,17 @@ function animate() {
         fpsTime = 0;
     }
     
-    if (gameState.paused) {
-        renderer.render(scene, camera);
-        return;
+    // Update animations if game not paused
+    if (!gameState.paused) {
+        const deltaTime = clock.getDelta();
+        
+        // Update all people movement
+        people.forEach((person) => {
+            updatePersonMovement(person, deltaTime);
+        });
     }
     
+    // Player movement
     velocity.x -= velocity.x * 10.0 * delta;
     velocity.z -= velocity.z * 10.0 * delta;
     
@@ -1565,9 +1605,14 @@ function animate() {
         canJump = true;
     }
     
-    updateObjects(delta);
+    // Update monument rotation
+    if (monument) {
+        monument.rotation.y += 0.01;
+    }
+    
     updateMiniMap();
     
+    // Yearly simulation
     const currentTime = Date.now();
     if (gameState.started && currentTime - lastSimulationTime > CONFIG.SIMULATION_INTERVAL) {
         simulateYear();
@@ -1577,6 +1622,7 @@ function animate() {
     renderer.render(scene, camera);
 }
 
+// Initialize everything
 window.addEventListener('DOMContentLoaded', () => {
     initVRScene();
     window.startGame = startGame;
